@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101510">
+  <title>Face Detection Stream</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+      background: #101510;
+      color: #eef5eb;
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px 16px;
+      display: grid;
+      place-items: center;
+    }
+
+    main { width: min(100%, 760px); }
+
+    h1 { margin: 0 0 6px; font-size: clamp(1.5rem, 5vw, 2rem); }
+
+    .hint, #status, #result { color: #b7c3b4; }
+
+    .video {
+      margin-top: 20px;
+      overflow: hidden;
+      border: 1px solid #354334;
+      border-radius: 14px;
+      background: #070a07;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 4 / 3;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 9px;
+      padding: 11px 18px;
+      background: #8ed36c;
+      color: #10200b;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #status[data-state="connected"] { color: #8ed36c; }
+    #status[data-state="error"] { color: #ff9a8f; }
+
+    @media (max-width: 480px) {
+      body { padding: 18px 12px; }
+      .video { margin-top: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Face Detection Stream</h1>
+    <div class="hint">Live feed from the webcam connected to the server computer.</div>
+    <div class="video">
+      <canvas id="feed" width="640" height="480" aria-label="Live webcam feed"></canvas>
+    </div>
+    <div class="controls">
+      <button id="capture" type="button" disabled>Capture &amp; analyze</button>
+      <span id="status" role="status" aria-live="polite">Connecting to the stream…</span>
+    </div>
+    <p id="result" aria-live="polite">Waiting for the first camera frame.</p>
+  </main>
+  <script>
+    const canvas = document.getElementById("feed");
+    const context = canvas.getContext("2d");
+    const captureButton = document.getElementById("capture");
+    const status = document.getElementById("status");
+    const result = document.getElementById("result");
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${location.hostname}:8765`;
+    let currentFrame = null;
+    let faces = [];
+    let reconnectDelay = 1000;
+    const maxReconnectDelay = 10000;
+    let socket = null;
+
+    function render() {
+      if (!currentFrame) return;
+      context.drawImage(currentFrame, 0, 0, canvas.width, canvas.height);
+      context.lineWidth = 3;
+      context.strokeStyle = "#8ed36c";
+      context.fillStyle = "#8ed36c";
+      context.font = "16px system-ui, sans-serif";
+
+      for (const [x1, y1, x2, y2, confidence] of faces) {
+        context.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        context.fillText(`${(confidence * 100).toFixed(0)}%`, x1, Math.max(18, y1 - 6));
+      }
+    }
+
+    function connectWebSocket() {
+      socket = new WebSocket(wsUrl);
+      socket.binaryType = "blob";
+
+      socket.addEventListener("open", () => {
+        status.textContent = "Connected; waiting for camera frames…";
+        status.dataset.state = "connected";
+        reconnectDelay = 1000; // Reset delay on successful connection
+      });
+
+      socket.addEventListener("message", async (event) => {
+        if (event.data instanceof Blob) {
+          const frame = await createImageBitmap(event.data);
+          if (currentFrame) currentFrame.close();
+          currentFrame = frame;
+          captureButton.disabled = false;
+          render();
+          return;
+        }
+
+        const message = JSON.parse(event.data);
+        if (message.type === "frame") {
+          faces = message.faces;
+          render();
+        } else if (message.type === "capture") {
+          if (message.error) {
+            result.textContent = `Capture failed: ${message.error}`;
+          } else {
+            result.textContent =
+              `Capture complete: ${message.faces} face(s); confidences: ` +
+              `${message.confidences.join(", ") || "none"}. Results are also in the server terminal.`;
+          }
+        }
+      });
+
+      socket.addEventListener("close", () => {
+        status.textContent = "Stream disconnected. Reconnecting...";
+        status.dataset.state = "error";
+        captureButton.disabled = true;
+        scheduleReconnect();
+      });
+
+      socket.addEventListener("error", () => {
+        status.textContent = "Connection error. Retrying...";
+        status.dataset.state = "error";
+      });
+    }
+
+    function scheduleReconnect() {
+      status.textContent = `Stream disconnected. Reconnecting in ${reconnectDelay / 1000}s...`;
+      setTimeout(() => {
+        status.textContent = "Reconnecting...";
+        connectWebSocket();
+        // Exponential backoff with max cap
+        reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
+      }, reconnectDelay);
+    }
+
+    captureButton.addEventListener("click", () => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        result.textContent = "Analyzing the latest frame…";
+        socket.send("capture");
+      }
+    });
+
+    // Initial connection
+    connectWebSocket();
+  </script>
+</body>
+</html>
